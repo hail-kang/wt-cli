@@ -94,6 +94,47 @@ usage() {
     echo "  wt prune"
 }
 
+# Recursively create symlinks
+# Args: $1 = source dir (in .ln), $2 = target dir (in worktree), $3 = relative path for display
+create_symlinks_recursive() {
+    local src_dir="$1"
+    local tgt_dir="$2"
+    local rel_path="${3:-}"
+
+    for item in "$src_dir"/* "$src_dir"/.*; do
+        local basename=$(basename "$item")
+
+        # Exclude . and ..
+        if [ "$basename" = "." ] || [ "$basename" = ".." ]; then
+            continue
+        fi
+
+        # Check if file/folder exists
+        if [ ! -e "$item" ]; then
+            continue
+        fi
+
+        local target="$tgt_dir/$basename"
+        local display_name="${rel_path}${rel_path:+/}$basename"
+
+        # If target is a regular directory (not symlink) and source is also a directory,
+        # recurse into it to handle nested files
+        if [ -d "$item" ] && [ -d "$target" ] && [ ! -L "$target" ]; then
+            create_symlinks_recursive "$item" "$target" "$display_name"
+            continue
+        fi
+
+        # Skip if already exists (file or symlink)
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            echo "  Skipped: $display_name (already exists)"
+            continue
+        fi
+
+        ln -s "$item" "$target"
+        echo "  Linked: $display_name"
+    done
+}
+
 # Create symlinks in worktree
 create_symlinks() {
     local worktree_path="$1"
@@ -105,30 +146,7 @@ create_symlinks() {
 
     echo -e "${GREEN}Creating symlinks... (from $LN_DIR)${NC}"
 
-    # Create symlinks for all files and folders in LN_DIR
-    for item in "$LN_DIR"/* "$LN_DIR"/.*; do
-        # Exclude . and ..
-        local basename=$(basename "$item")
-        if [ "$basename" = "." ] || [ "$basename" = ".." ]; then
-            continue
-        fi
-
-        # Check if file/folder exists
-        if [ ! -e "$item" ]; then
-            continue
-        fi
-
-        local target="$worktree_path/$basename"
-
-        # Skip if already exists
-        if [ -e "$target" ] || [ -L "$target" ]; then
-            echo "  Skipped: $basename (already exists)"
-            continue
-        fi
-
-        ln -s "$item" "$target"
-        echo "  Linked: $basename"
-    done
+    create_symlinks_recursive "$LN_DIR" "$worktree_path" ""
 
     echo -e "${GREEN}Symlinks created!${NC}"
 }
