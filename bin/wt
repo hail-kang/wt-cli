@@ -1,0 +1,329 @@
+#!/bin/bash
+
+# Git Worktree management script
+# Usage: wt <command> [options]
+#
+# This script automatically detects the bare repository location
+# by finding *.git directory or reading the .git file in worktrees.
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Find *.git directory by traversing up from current directory
+find_git_dirs() {
+    local current_dir="$PWD"
+
+    # Traverse up to find *.git directory
+    while [ "$current_dir" != "/" ]; do
+        # Check for *.git directory
+        for git_dir in "$current_dir"/*.git; do
+            if [ -d "$git_dir" ] && [ -d "$git_dir/objects" ]; then
+                # Found bare repo
+                GIT_DIR="$git_dir"
+                BASE_DIR="$current_dir"
+
+                # Find *.ln directory in BASE_DIR
+                LN_DIR=""
+                for ln_dir in "$BASE_DIR"/*.ln; do
+                    if [ -d "$ln_dir" ]; then
+                        LN_DIR="$ln_dir"
+                        break
+                    fi
+                done
+                return 0
+            fi
+        done
+
+        # If inside a worktree: extract bare repo path from .git file
+        if [ -f "$current_dir/.git" ]; then
+            local gitdir
+            gitdir=$(sed 's/gitdir: //' "$current_dir/.git")
+            # /path/to/bare.git/worktrees/name -> /path/to/bare.git
+            GIT_DIR=$(dirname "$(dirname "$gitdir")")
+            BASE_DIR=$(dirname "$GIT_DIR")
+
+            # Find *.ln directory
+            LN_DIR=""
+            for ln_dir in "$BASE_DIR"/*.ln; do
+                if [ -d "$ln_dir" ]; then
+                    LN_DIR="$ln_dir"
+                    break
+                fi
+            done
+            return 0
+        fi
+
+        current_dir=$(dirname "$current_dir")
+    done
+
+    echo -e "${RED}Error: Could not find *.git bare repository${NC}" >&2
+    echo -e "${YELLOW}Hint: Run this command from a worktree directory or a directory containing *.git${NC}" >&2
+    exit 1
+}
+
+# Convert branch name to folder name (slash -> dash)
+to_folder_name() {
+    echo "$1" | tr '/' '-'
+}
+
+usage() {
+    echo "Git Worktree management script"
+    echo ""
+    echo "Usage: wt <command> [options]"
+    echo ""
+    echo "Commands:"
+    echo "  list                        List all worktrees"
+    echo "  add <name> [branch]         Add a new worktree (uses name as branch if not specified)"
+    echo "  new <name> <base>           Create a new branch from base and add worktree"
+    echo "  prune                       Prune invalid worktrees"
+    echo "  remove <name>               Remove a worktree"
+    echo "  link <name>                 Add symlinks to an existing worktree"
+    echo "  info                        Show detected path information"
+    echo ""
+    echo "Examples:"
+    echo "  wt list"
+    echo "  wt add main                     # main branch -> main folder"
+    echo "  wt add feat/hail-xxx            # feat/hail-xxx branch -> feat-hail-xxx folder"
+    echo "  wt new feat/my-feature main     # branch from main -> feat-my-feature folder"
+    echo "  wt remove feat/hail-xxx         # remove feat-hail-xxx folder"
+    echo "  wt prune"
+}
+
+# Create symlinks in worktree
+create_symlinks() {
+    local worktree_path="$1"
+
+    if [ -z "$LN_DIR" ] || [ ! -d "$LN_DIR" ]; then
+        echo -e "${YELLOW}Warning: No symlink directory (*.ln) found. Skipping symlinks.${NC}"
+        return
+    fi
+
+    echo -e "${GREEN}Creating symlinks... (from $LN_DIR)${NC}"
+
+    # Create symlinks for all files and folders in LN_DIR
+    for item in "$LN_DIR"/* "$LN_DIR"/.*; do
+        # Exclude . and ..
+        local basename=$(basename "$item")
+        if [ "$basename" = "." ] || [ "$basename" = ".." ]; then
+            continue
+        fi
+
+        # Check if file/folder exists
+        if [ ! -e "$item" ]; then
+            continue
+        fi
+
+        local target="$worktree_path/$basename"
+
+        # Skip if already exists
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            echo "  Skipped: $basename (already exists)"
+            continue
+        fi
+
+        ln -s "$item" "$target"
+        echo "  Linked: $basename"
+    done
+
+    echo -e "${GREEN}Symlinks created!${NC}"
+}
+
+# Show path info
+cmd_info() {
+    echo -e "${GREEN}=== Path Information ===${NC}"
+    echo "BASE_DIR: $BASE_DIR"
+    echo "GIT_DIR:  $GIT_DIR"
+    echo "LN_DIR:   ${LN_DIR:-none}"
+}
+
+# List worktrees
+cmd_list() {
+    echo -e "${GREEN}=== Worktree List ===${NC}"
+    git -C "$GIT_DIR" worktree list
+}
+
+# Add worktree
+cmd_add() {
+    local name="$1"
+    local branch="${2:-$1}"
+
+    if [ -z "$name" ]; then
+        echo -e "${RED}Error: Please specify a worktree name${NC}"
+        echo "Usage: wt add <name> [branch]"
+        exit 1
+    fi
+
+    # Folder name: convert slash to dash
+    local folder_name=$(to_folder_name "$name")
+    local worktree_path="$BASE_DIR/$folder_name"
+
+    if [ -d "$worktree_path" ]; then
+        echo -e "${RED}Error: $worktree_path already exists${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}Adding worktree: $folder_name (branch: $branch)${NC}"
+
+    # Check if branch exists
+    if git -C "$GIT_DIR" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
+        # Local branch exists
+        git -C "$GIT_DIR" worktree add "$worktree_path" "$branch"
+    elif git -C "$GIT_DIR" show-ref --verify --quiet "refs/remotes/origin/$branch" 2>/dev/null; then
+        # Only remote branch exists - create tracking branch
+        git -C "$GIT_DIR" worktree add "$worktree_path" -b "$branch" "origin/$branch"
+    else
+        echo -e "${YELLOW}Branch '$branch' does not exist. Creating new branch.${NC}"
+        git -C "$GIT_DIR" worktree add -b "$branch" "$worktree_path"
+    fi
+
+    # Create symlinks
+    create_symlinks "$worktree_path"
+
+    echo ""
+    echo -e "${GREEN}Done! Worktree created at: $worktree_path${NC}"
+}
+
+# Prune worktrees
+cmd_prune() {
+    echo -e "${GREEN}Pruning invalid worktrees...${NC}"
+    git -C "$GIT_DIR" worktree prune -v
+    echo -e "${GREEN}Done!${NC}"
+}
+
+# Remove worktree
+cmd_remove() {
+    local name="$1"
+
+    if [ -z "$name" ]; then
+        echo -e "${RED}Error: Please specify a worktree name${NC}"
+        echo "Usage: wt remove <name>"
+        exit 1
+    fi
+
+    local folder_name=$(to_folder_name "$name")
+    local worktree_path="$BASE_DIR/$folder_name"
+
+    if [ ! -d "$worktree_path" ]; then
+        echo -e "${RED}Error: $worktree_path does not exist${NC}"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}Removing worktree: $folder_name${NC}"
+    git -C "$GIT_DIR" worktree remove "$worktree_path" --force
+    echo -e "${GREEN}Done!${NC}"
+}
+
+# Create new branch and add worktree
+cmd_new() {
+    local name="$1"
+    local base="$2"
+
+    if [ -z "$name" ] || [ -z "$base" ]; then
+        echo -e "${RED}Error: Please specify both branch name and base branch${NC}"
+        echo "Usage: wt new <name> <base>"
+        echo "Example: wt new my-feature main"
+        exit 1
+    fi
+
+    # Folder name: convert slash to dash
+    local folder_name=$(to_folder_name "$name")
+    local worktree_path="$BASE_DIR/$folder_name"
+
+    if [ -d "$worktree_path" ]; then
+        echo -e "${RED}Error: $worktree_path already exists${NC}"
+        exit 1
+    fi
+
+    # Check if branch already exists
+    if git -C "$GIT_DIR" show-ref --verify --quiet "refs/heads/$name" 2>/dev/null; then
+        echo -e "${RED}Error: Branch '$name' already exists. Use 'add' command instead.${NC}"
+        exit 1
+    fi
+
+    # Check base branch
+    local base_ref=""
+    if git -C "$GIT_DIR" show-ref --verify --quiet "refs/heads/$base" 2>/dev/null; then
+        base_ref="$base"
+    elif git -C "$GIT_DIR" show-ref --verify --quiet "refs/remotes/origin/$base" 2>/dev/null; then
+        base_ref="origin/$base"
+    else
+        echo -e "${RED}Error: Base branch '$base' not found${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}Creating new branch: $name -> $folder_name (from $base_ref)${NC}"
+    git -C "$GIT_DIR" worktree add -b "$name" "$worktree_path" "$base_ref"
+
+    # Create symlinks
+    create_symlinks "$worktree_path"
+
+    echo ""
+    echo -e "${GREEN}Done! Worktree created at: $worktree_path${NC}"
+}
+
+# Add symlinks to existing worktree
+cmd_link() {
+    local name="$1"
+
+    if [ -z "$name" ]; then
+        echo -e "${RED}Error: Please specify a worktree name${NC}"
+        echo "Usage: wt link <name>"
+        exit 1
+    fi
+
+    local folder_name=$(to_folder_name "$name")
+    local worktree_path="$BASE_DIR/$folder_name"
+
+    if [ ! -d "$worktree_path" ]; then
+        echo -e "${RED}Error: $worktree_path does not exist${NC}"
+        exit 1
+    fi
+
+    create_symlinks "$worktree_path"
+}
+
+# Handle help or empty command before finding git dirs
+case "${1:-}" in
+    -h|--help|help|"")
+        usage
+        exit 0
+        ;;
+esac
+
+# Find git directory info
+find_git_dirs
+
+# Main logic
+case "${1:-}" in
+    list)
+        cmd_list
+        ;;
+    add)
+        cmd_add "$2" "$3"
+        ;;
+    new)
+        cmd_new "$2" "$3"
+        ;;
+    prune)
+        cmd_prune
+        ;;
+    remove)
+        cmd_remove "$2"
+        ;;
+    link)
+        cmd_link "$2"
+        ;;
+    info)
+        cmd_info
+        ;;
+    *)
+        echo -e "${RED}Unknown command: $1${NC}"
+        usage
+        exit 1
+        ;;
+esac
